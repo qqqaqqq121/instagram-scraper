@@ -140,8 +140,10 @@ class InstagramScraper(object):
 
         self.session.headers = {'user-agent': CHROME_WIN_UA}
         if self.cookiejar and os.path.exists(self.cookiejar):
+            print("Loading from cookie")
             with open(self.cookiejar, 'rb') as f:
                 self.session.cookies.update(pickle.load(f))
+            print("self.session.cookies", self.session.cookies)
         self.session.cookies.set('ig_pr', '1')
         self.rhx_gis = ""
 
@@ -168,6 +170,7 @@ class InstagramScraper(object):
             if self.quit:
                 return
         time.sleep(secs % min_delay)
+        time.sleep(random.randint(3, 9))
 
     def _retry_prompt(self, url, exception_message):
         """Show prompt and return True: retry, False: ignore, None: abort"""
@@ -202,6 +205,11 @@ class InstagramScraper(object):
                 response = self.session.get(timeout=CONNECT_TIMEOUT, cookies=self.cookies, *args, **kwargs)
                 if response.status_code == 404:
                     return
+                elif response.status_code == 429:
+                    try:
+                        time.sleep(int(response.headers["Retry-After"]))
+                    except:
+                        return
                 response.raise_for_status()
                 content_length = response.headers.get('Content-Length')
                 if content_length is not None and len(response.content) != int(content_length):
@@ -239,10 +247,10 @@ class InstagramScraper(object):
 
     def authenticate_as_guest(self):
         """Authenticate as a guest/non-signed in user"""
-        self.session.headers.update({'Referer': BASE_URL, 'user-agent': STORIES_UA})
-        req = self.session.get(BASE_URL)
+        self.session.headers.update({'Referer': BASE_URL + "accounts/login", 'user-agent': STORIES_UA})
+        resp = self.session.get(BASE_URL)
 
-        self.session.headers.update({'X-CSRFToken': req.cookies['csrftoken']})
+        self.session.headers.update({'X-CSRFToken': resp.cookies['csrftoken']})
 
         self.session.headers.update({'user-agent': CHROME_WIN_UA})
         self.rhx_gis = ""
@@ -251,42 +259,55 @@ class InstagramScraper(object):
     def authenticate_with_login(self):
         """Logs in to instagram."""
         self.session.headers.update({'Referer': BASE_URL, 'user-agent': STORIES_UA})
-        req = self.session.get(BASE_URL)
+        resp = self.session.get(BASE_URL)
+        print("resp.status_code", resp.status_code)
 
-        self.session.headers.update({'X-CSRFToken': req.cookies['csrftoken']})
+        self.session.headers.update({'X-CSRFToken': resp.cookies['csrftoken']})
+        if 'sessionid' not in self.session.cookies or self.session.cookies['sessionid'] == '':
+            print("No sessionid, getting one")
 
-        login_data = {'username': self.login_user, 'password': self.login_pass}
-        login = self.session.post(LOGIN_URL, data=login_data, allow_redirects=True)
-        self.session.headers.update({'X-CSRFToken': login.cookies['csrftoken']})
-        self.cookies = login.cookies
-        login_text = self._get_json(login.text)
+            # login_data = {'username': self.login_user, 'password': self.login_pass}
+            login_data = {'username': self.login_user, 'enc_password': f'#PWD_INSTAGRAM:0:0:{self.login_pass}', 'optIntoOneTap':False}
+            # login_data = {'username': login_user, 'enc_password': f"#PWD_INSTAGRAM_BROWSER:0:{str(int(time.time()))}:{login_pass}"} # https://stackoverflow.com/a/61880201
+            self.session.headers.update({'Referer': LOGIN_URL})
+            login = self.session.post(LOGIN_URL, data=login_data, allow_redirects=True)
+            print("login.status_code", login.status_code)
+            print("login.cookies", login.cookies)
+            self.session.headers.update({'X-CSRFToken': login.cookies['csrftoken']})
+            self.cookies = login.cookies
+            login_text = self._get_json(login.text)
+            print("login_text", login_text)
 
-        if login_text.get('authenticated') and login.status_code == 200:
-            self.authenticated = True
-            self.logged_in = True
-            self.session.headers.update({'user-agent': CHROME_WIN_UA})
-            self.rhx_gis = ""
-        else:
-            self.logger.error('Login failed for ' + self.login_user)
-
-            if 'checkpoint_url' in login_text:
-                checkpoint_url = login_text.get('checkpoint_url')
-                self.logger.error('Please verify your account at ' + BASE_URL[0:-1] + checkpoint_url)
-
-                if self.interactive is True:
-                    self.login_challenge(checkpoint_url)
-            elif 'errors' in login_text:
-                for count, error in enumerate(login_text['errors'].get('error')):
-                    count += 1
-                    self.logger.debug('Session error %(count)s: "%(error)s"' % locals())
+            if login_text.get('authenticated') and login.status_code == 200:
+                self.authenticated = True
+                self.logged_in = True
+                self.session.headers.update({'user-agent': CHROME_WIN_UA})
+                self.rhx_gis = ""
             else:
-                self.logger.error(json.dumps(login_text))
-            sys.exit(1)
+                self.logger.error('Login failed for ' + self.login_user)
+
+                if 'checkpoint_url' in login_text:
+                    checkpoint_url = login_text.get('checkpoint_url')
+                    self.logger.error('Please verify your account at ' + BASE_URL[0:-1] + checkpoint_url)
+
+                    if self.interactive is True:
+                        self.login_challenge(checkpoint_url)
+                elif 'errors' in login_text:
+                    for count, error in enumerate(login_text['errors'].get('error')):
+                        count += 1
+                        self.logger.debug('Session error %(count)s: "%(error)s"' % locals())
+                else:
+                    self.logger.error(json.dumps(login_text))
+                sys.exit(1)
+        else:
+            print("Reusing session id from saved cookie")
+            self.cookies = self.session.cookies
+        print("self.cookies", self.cookies)
 
     def login_challenge(self, checkpoint_url):
         self.session.headers.update({'Referer': BASE_URL})
-        req = self.session.get(BASE_URL[:-1] + checkpoint_url)
-        self.session.headers.update({'X-CSRFToken': req.cookies['csrftoken'], 'X-Instagram-AJAX': '1'})
+        resp = self.session.get(BASE_URL[:-1] + checkpoint_url)
+        self.session.headers.update({'X-CSRFToken': resp.cookies['csrftoken'], 'X-Instagram-AJAX': '1'})
 
         self.session.headers.update({'Referer': BASE_URL[:-1] + checkpoint_url})
         mode = int(input('Choose a challenge mode (0 - SMS, 1 - Email): '))
@@ -715,7 +736,7 @@ class InstagramScraper(object):
                     self.logger.error("Unable to scrape user - %s" % username)
         finally:
             self.quit = True
-            self.logout()
+            # self.logout()
 
     def get_profile_pic(self, dst, executor, future_to_item, user, username):
         if 'image' not in self.media_types:
@@ -1190,7 +1211,7 @@ class InstagramScraper(object):
 
     def templatefilename(self, item):
 
-        for url in item['urls']:
+        for item_index, url in enumerate(item['urls']):
             filename, extension = os.path.splitext(os.path.split(url.split('?')[0])[1])
             try:
                 template = self.template
@@ -1209,7 +1230,15 @@ class InstagramScraper(object):
                                    'm': time.strftime('%Mm', time.localtime(self.__get_timestamp(item))),
                                    's': time.strftime('%Ss', time.localtime(self.__get_timestamp(item)))}
 
-                customfilename = str(template.format(**template_values) + extension)
+                if item_index >= 1:
+                    customfilename = str(template.format(**template_values) + "_" + str(item_index) + "_" + filename + extension)
+                    self.logger.info("item_index %d : %s" % (item_index, customfilename))
+                else:
+                    if len(item['urls']) > 1: 
+                        customfilename = str(template.format(**template_values) + "_0" + extension)
+                    else:
+                        customfilename = str(template.format(**template_values) + extension)
+                #customfilename = str(template.format(**template_values) + extension)
                 yield url, customfilename
             except KeyError:
                 customfilename = str(filename + extension)
@@ -1430,6 +1459,7 @@ class InstagramScraper(object):
 
 
 def main():
+    print("JACKJACK")
     parser = argparse.ArgumentParser(
         description="instagram-scraper scrapes and downloads an instagram user's photos and videos.",
         epilog=textwrap.dedent("""
